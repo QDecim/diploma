@@ -53,7 +53,7 @@ mediapipe, speechbrain, soundfile, facenet-pytorch). GPU не використо
    mean_abs_roll як цілі тією ж моделлю й тим самим within-sex тестом), **`--residualize mean_abs_yaw[,log_sharpness]`**
    (вилучає вплив відео-ковариат з усіх AM перед моделлю; ковариати беруться з `--controls faces`; вивід у
    `results_resid_<covars>.csv`, НЕ у results.csv; дописує таблицю «AM vs ковариата до → після»; залишки обчислюються
-   на всіх дикторах, не у кожному LOO-фолді — маленький ризик витоку, озвучений у docstring). `--perm` дефолт 200, для фіналу 2000.
+   на всіх дикторах — глобальний режим, ризик витоку; **`--perfold`** (з `--residualize`) = строгий режим: корекція у кожному LOO-фолді лише на тренувальних дикторах, з тестом на відсутність витоку в selftest; `--perm` дефолт 200, для фіналу 2000.
 Усі скрипти мають `--selftest` (синтетика, без даних/моделей, крім torch-частин flame_ams).
 
 ## 3. 18 AMs і піднабір
@@ -91,6 +91,7 @@ eye_mouth, philtrum, lip_height, nose_protrusion, eye_height, brow_eye, upper_li
    (вони в .gitignore). Треба запустити вдома: спочатку без прапорця (вже є: results.csv), потім
    `--controls faces --residualize mean_abs_yaw` і `--residualize mean_abs_yaw,log_sharpness`; порівняти p(within) з 0.028
    і таблицею AM↔yaw до/після. Також варіант per-fold (строгий без витоку) — не реалізовано, лише за потреби.
+1c. ✅ КОД (2026-10-23): строгий per-fold режим `--perfold` + selftest на витік. НЕ запущено на реальних даних: вивід у `results_resid_<covars>_perfold.csv`, p — у консолі.
 1b. ✅ Residualisation запущено: p(within) 0.247 / 0.267 (див. §4). Основний висновок у §5.5 треба переписати: зв'язок понад стать не значущий після корекції на yaw.
 2. Вік — не збираємо (обмеження, записати у висновках). Другий ролик на людину — недоступний.
 3. Візуально звірити меші (`flame_ams.py mesh --id N --out pN.obj`) з фото для кількох дикторів.
@@ -108,6 +109,8 @@ python flame_ams.py analyze --labels labels.npz --reliability reliability.csv --
 python voice_stage.py --audio dataset/audio --out voices.npz
 python regress_stage.py --voices voices.npz --labels labels.npz --targets targets.json --meta dataset/meta.csv --perm 2000 --controls faces
 python regress_stage.py --voices voices.npz --labels labels.npz --targets targets.json --meta dataset/meta.csv --perm 2000 --exclude 1,2,8
+python regress_stage.py --controls faces --residualize mean_abs_yaw --perm 2000 --perfold
+python regress_stage.py --controls faces --residualize mean_abs_yaw,log_sharpness --perm 2000 --perfold
 ```
 Поради користувачу: зберігати вивід у `logs/<крок>_<дата>.txt` через `| tee`, щоб не копіювати в чат.
 

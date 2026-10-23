@@ -55,6 +55,27 @@ ALPHAS = np.logspace(-1, 4, 11)
 
 
 # ------------------------------------------------------------------ model
+def _fit_predict(Xtr, Ytr, Xte, alphas=ALPHAS):
+    """Fit ridge on (Xtr, Ytr) with alpha chosen by LOO inside the training set; predict Xte.
+    Returns (predictions (k,m), chosen alpha)."""
+    mx, sx = Xtr.mean(0), Xtr.std(0) + 1e-8
+    my, sy = Ytr.mean(0), Ytr.std(0) + 1e-8
+    Xs, Ys = (Xtr - mx) / sx, (Ytr - my) / sy
+    s, U = np.linalg.eigh(Xs @ Xs.T)
+    s = np.clip(s, 0, None)
+    UtY = U.T @ Ys
+    best, best_mse = alphas[0], np.inf
+    for al in alphas:                       # closed-form leave-one-out error of ridge (hat-matrix trick)
+        sh = s / (s + al)
+        res = (Ys - U @ (sh[:, None] * UtY)) / (1 - (U ** 2) @ sh)[:, None]
+        mse = float(np.mean(res ** 2))
+        if mse < best_mse:
+            best, best_mse = al, mse
+    coef = U @ (UtY / (s + best)[:, None])
+    pred = ((((Xte - mx) / sx) @ Xs.T) @ coef) * sy + my
+    return pred, best
+
+
 def loo_predict(X, Y, alphas=ALPHAS):
     """Leave-one-row-out ridge. X (n,d), Y (n,m) -> predictions (n,m) and the alpha chosen in each fold."""
     n = len(X)
@@ -62,23 +83,28 @@ def loo_predict(X, Y, alphas=ALPHAS):
     chosen = []
     for i in range(n):
         tr = np.arange(n) != i
-        mx, sx = X[tr].mean(0), X[tr].std(0) + 1e-8
-        my, sy = Y[tr].mean(0), Y[tr].std(0) + 1e-8
-        Xs, Ys = (X[tr] - mx) / sx, (Y[tr] - my) / sy
-        s, U = np.linalg.eigh(Xs @ Xs.T)
-        s = np.clip(s, 0, None)
-        UtY = U.T @ Ys
-        best, best_mse = alphas[0], np.inf
-        for al in alphas:                       # closed-form leave-one-out error of ridge (hat-matrix trick)
-            sh = s / (s + al)
-            res = (Ys - U @ (sh[:, None] * UtY)) / (1 - (U ** 2) @ sh)[:, None]
-            mse = float(np.mean(res ** 2))
-            if mse < best_mse:
-                best, best_mse = al, mse
-        coef = U @ (UtY / (s + best)[:, None])
-        P[i] = (((X[i] - mx) / sx) @ Xs.T @ coef) * sy + my
-        chosen.append(best)
+        pred, al = _fit_predict(X[tr], Y[tr], X[i:i + 1], alphas)
+        P[i] = pred[0]
+        chosen.append(al)
     return P, chosen
+
+
+def loo_predict_perfold(X, Y, Z, alphas=ALPHAS):
+    """Strict version: in every LOO fold the covariates are regressed out of the TRAINING AMs only (intercept + Z),
+    the voice model is fitted on those residuals, and the held-out speaker's true target is residualised with the
+    same training-fold coefficients. Nothing about the held-out speaker enters the fit.
+    Returns (predictions of residualised AMs (n,m), residualised true targets (n,m))."""
+    n = len(X)
+    P = np.zeros_like(Y, dtype=np.float64)
+    Yt = np.zeros_like(Y, dtype=np.float64)
+    for i in range(n):
+        tr = np.arange(n) != i
+        Zc = np.column_stack([np.ones(n), Z])
+        beta, *_ = np.linalg.lstsq(Zc[tr], Y[tr], rcond=None)
+        Ytr_res = Y[tr] - Zc[tr] @ beta
+        Yt[i] = Y[i] - Zc[i] @ beta
+        P[i] = _fit_predict(X[tr], Ytr_res, X[i:i + 1], alphas)[0][0]
+    return P, Yt
 
 
 def sex_baseline(Y, grp):
@@ -107,7 +133,7 @@ def metrics(Y, P, grp):
     return dict(r_all=pearson(Y, P), r_within=pearson(demean_by_group(Y, grp), demean_by_group(P, grp)))
 
 
-def perm_p(X, Y, grp, observed, within, n_perm, seed=0):
+def perm_p(X, Y, grp, observed, within, n_perm, seed=0, Z=None):
     """p-value that the mean r over targets is this high by chance. within=False shuffles voices over all
     speakers (tests voice->AM incl. the sex effect); within=True shuffles only inside each sex (tests what is left
     after sex is held fixed). Returns (p, mean of the null distribution); leave-one-out r is biased below 0
@@ -122,8 +148,12 @@ def perm_p(X, Y, grp, observed, within, n_perm, seed=0):
                 idx[m] = rng.permutation(m)
         else:
             idx = rng.permutation(len(X))
-        P, _ = loo_predict(X[idx], Y)
-        r = float(np.nanmean(metrics(Y, P, grp)["r_within" if within else "r_all"]))
+        if Z is None:
+            P, _ = loo_predict(X[idx], Y)
+            T = Y
+        else:                                   # strict per-fold residualisation (truth is the same every time)
+            P, T = loo_predict_perfold(X[idx], Y, Z)
+        r = float(np.nanmean(metrics(T, P, grp)["r_within" if within else "r_all"]))
         null.append(r)
         cnt += int(r >= observed)
     return (1 + cnt) / (1 + n_perm), float(np.mean(null))
@@ -279,25 +309,36 @@ def run(a):
     if getattr(a, "exclude", ""):
         print(f"\nSENSITIVITY RUN: --exclude {a.exclude}")
     cov = [c.strip() for c in (getattr(a, "residualize", "") or "").split(",") if c.strip()]
+    perfold = bool(getattr(a, "perfold", False)) and bool(cov)
+    Y_raw, Zcov = Y.copy(), None
     if cov:
         bad = [c for c in cov if c not in CONTROL_NAMES]
         if bad:
             raise SystemExit(f"--residualize: unknown covariates {bad}; choose from {CONTROL_NAMES}")
         if not a.controls:
             raise SystemExit("--residualize needs --controls DIR (the covariates come from DIR/<id>.npz)")
-        Z = covariate_matrix(a.controls, ids, cov)
-        Y_raw = Y.copy()
-        Y = residualize(Y, Z)
-        print_residual_effect(names, Y_raw, Y, Z, cov)
-        print("  note: all subsequent numbers are for the residualised AMs (the covariates are removed from the targets).")
+        Zcov = covariate_matrix(a.controls, ids, cov)
+        Y_glob = residualize(Y_raw, Zcov)
+        print_residual_effect(names, Y_raw, Y_glob, Zcov, cov)
+        Y = Y_glob                                  # used for descriptives (r_sex) and the PCs
+        if perfold:
+            print("  mode: STRICT per-fold residualisation (covariates removed from the training AMs in every LOO fold;"
+                  "\n        r_sex and PCs remain in-sample descriptives)")
+        else:
+            print("  mode: global residualisation (fit on all speakers, see docstring)")
     sexes, counts = np.unique(grp, return_counts=True)
     print(f"\n{n} speakers; sex counts: {dict(zip(sexes.tolist(), counts.tolist()))}; embedding dim {X.shape[1]}")
     if len(sexes) < 2 or counts.min() < 3:
         print("  WARNING: a sex has fewer than 3 speakers; the within-sex numbers are not meaningful.")
     print(f"  critical |r| for p<0.05 (two-sided, n={n}): {abs(_rcrit(n)):.2f}  (before any multiple-comparison correction)\n")
 
-    P, al = loo_predict(X, Y)
-    M = metrics(Y, P, grp)
+    if perfold:
+        P, Yt = loo_predict_perfold(X, Y_raw, Zcov)   # evaluated against the fold-wise residualised truth
+        M = metrics(Yt, P, grp)
+    else:
+        P, al = loo_predict(X, Y)
+        Yt = Y
+        M = metrics(Y, P, grp)
     ref = "m" if "m" in sexes else sexes[-1]
     MB = pearson(Y, (grp == ref).astype(np.float64)[:, None].repeat(Y.shape[1], 1))   # AM vs sex, in-sample
     print(f"{'AM':22s} {'r_all':>6s} {'r_within':>9s} {'r_sex(' + ref + ')':>8s}")
@@ -327,9 +368,12 @@ def run(a):
 
     p_in = None
     if a.perm > 0:
-        Ys = Y[:, si]
-        p_all, nm_all = perm_p(X, Ys, grp, o_all, False, a.perm)
-        p_in, nm_in = perm_p(X, Ys, grp, o_in, True, a.perm)
+        if perfold:
+            Ys, Zp = Y_raw[:, si], Zcov
+        else:
+            Ys, Zp = Y[:, si], None
+        p_all, nm_all = perm_p(X, Ys, grp, o_all, False, a.perm, Z=Zp)
+        p_in, nm_in = perm_p(X, Ys, grp, o_in, True, a.perm, Z=Zp)
         print(f"\npermutation tests ({a.perm} shuffles, statistic = mean r over the non-redundant AMs):")
         print(f"  voices shuffled over all speakers  : p = {p_all:.3f}   (null mean r_all {nm_all:+.2f}; includes the sex effect)")
         print(f"  voices shuffled within each sex    : p = {p_in:.3f}   (null mean r_within {nm_in:+.2f}; voice beyond sex)")
@@ -344,7 +388,7 @@ def run(a):
             for k in range(len(names)):
                 w.writerow([names[k], int(names[k] in sel), f"{M['r_all'][k]:.4f}", f"{M['r_within'][k]:.4f}",
                             f"{MB[k]:.4f}"])
-        np.savez(Path(a.out).with_suffix(".npz"), ids=np.array(ids), sex=grp, names=np.array(names), true=Y, pred=P)
+        np.savez(Path(a.out).with_suffix(".npz"), ids=np.array(ids), sex=grp, names=np.array(names), true=Yt, pred=P)
         print("\nsaved", a.out, "and", Path(a.out).with_suffix(".npz"))
 
 
@@ -392,8 +436,33 @@ def selftest(seed=0):
     ok_rs = _residual_test()
     print("residualisation (removes a planted covariate, keeps the voice signal):", "ok" if ok_rs else "FAILED")
     ok = ok and ok_rs
+    ok_pf = _perfold_test()
+    print("per-fold residualisation (no leakage of the held-out speaker, signal kept):", "ok" if ok_pf else "FAILED")
+    ok = ok and ok_pf
     print("SELFTEST", "PASSED" if ok else "FAILED")
     raise SystemExit(0 if ok else 1)
+
+
+def _perfold_test(seed=3):
+    """Two properties of the strict version: (1) the prediction for speaker i must not depend on speaker i's own
+    AMs (no leakage); (2) it still recovers a voice signal that is not on the covariate."""
+    rng = np.random.default_rng(seed)
+    n, d, m = 36, 40, 3
+    grp = np.array(["m", "f"] * (n // 2))
+    z = rng.normal(size=(n, 3))
+    X = z @ rng.normal(size=(3, d)) + rng.normal(size=(n, d)) * 0.5
+    Zc = rng.normal(size=(n, 1))
+    Y = z @ rng.normal(size=(3, m)) + 2.0 * Zc + rng.normal(size=(n, m)) * 0.3
+    P1, Yt1 = loo_predict_perfold(X, Y, Zc)
+    Y2 = Y.copy()
+    Y2[0] += 100.0                                 # change only speaker 0's AMs
+    P2, _ = loo_predict_perfold(X, Y2, Zc)
+    no_leak = np.allclose(P1[0], P2[0], atol=1e-8)
+    rw = float(np.nanmean(metrics(Yt1, P1, grp)["r_within"]))
+    cov_left = float(np.nanmax(np.abs(pearson(Yt1, np.repeat(Zc, m, 1)))))
+    print(f"per-fold check: speaker-0 prediction unchanged by its own AMs: {no_leak}; "
+          f"r_within {rw:.2f}; max |r(resid truth, covariate)| {cov_left:.2f}")
+    return bool(no_leak and rw > 0.3 and cov_left < 0.3)
 
 
 def _residual_test(seed=2):
@@ -459,6 +528,8 @@ def main():
                     help="comma-separated speaker ids to leave out of everything (sensitivity check)")
     ap.add_argument("--controls", default=None,
                     help="directory with faces/<id>.npz: also run the negative controls (video conditions as targets)")
+    ap.add_argument("--perfold", action="store_true",
+                    help="with --residualize: strict per-fold residualisation (no held-out speaker in the fit)")
     ap.add_argument("--residualize", default="",
                     help="comma-separated video covariates (log_sharpness,log_face_px,mean_abs_yaw,mean_abs_roll) to "
                          "regress out of every AM before the model; needs --controls DIR for the covariates")
@@ -470,7 +541,7 @@ def main():
         cov = [x.strip() for x in a.residualize.split(",") if x.strip()]
         name = "results"
         if cov:
-            name += "_resid_" + "-".join(cov)
+            name += "_resid_" + "-".join(cov) + ("_perfold" if a.perfold else "")
         if ex:
             name += "_excl_" + "-".join(ex)
         a.out = name + ".csv"
