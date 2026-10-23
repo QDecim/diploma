@@ -1,0 +1,17 @@
+commands
+
+dataset/frames/
+dataset/audio/
+flame_data/
+face_landmarker.task
+pretrained_ecapa/
+prev/
+faces/
+*.obj
+*.npz
+
+*copy*.py
+*.zip
+*.7z
+*.tar
+*.tar.gz
