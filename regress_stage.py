@@ -33,10 +33,15 @@ Robustness checks (neither needs new data):
                     language), and the AM result cannot be credited to the face. If it does not, that particular
                     confounder is not visible (age and others are not excluded by this).
 
+  --residualize mean_abs_yaw[,log_sharpness]   regress these video covariates out of every AM before modelling
+                    (covariates from --controls DIR). Output goes to results_resid_<covars>.csv, not results.csv.
+                    Tests whether the within-sex result survives once head pose / sharpness are removed from the AMs.
+
 Usage:
   python regress_stage.py --voices voices.npz --labels labels.npz --targets targets.json --meta dataset/meta.csv
   python regress_stage.py ... --perm 2000 --controls faces
   python regress_stage.py ... --perm 2000 --exclude 1,2,8
+  python regress_stage.py ... --perm 2000 --controls faces --residualize mean_abs_yaw
   python regress_stage.py --selftest
 """
 import argparse
@@ -230,12 +235,61 @@ def run_controls(ctrl_dir, ids, X, grp, n_perm, am_ref=None):
     return out
 
 
+# ------------------------------------------------------------------ residualisation (video-condition confounders)
+def covariate_matrix(ctrl_dir, ids, cov):
+    """Video-condition covariates of the given speakers, from faces/<id>.npz. Raises if any speaker is missing."""
+    Z = []
+    for i in ids:
+        p = Path(ctrl_dir) / f"{i}.npz"
+        if not p.exists():
+            raise SystemExit(f"--residualize: missing {p} (every speaker in the regression needs a faces file)")
+        f = control_features(p)
+        Z.append([f[c] for c in cov])
+    return np.array(Z, dtype=np.float64)
+
+
+def residualize(Y, Z):
+    """Remove the linear effect of the covariates Z from every AM (intercept + standardised covariates).
+    Fitted on the AMs and covariates only; the voice is not used. Caveat: the fit uses all speakers, including the
+    one left out in each LOO fold, so this is not strictly leakage-free; a per-fold version would be stricter."""
+    Zc = np.column_stack([np.ones(len(Z)), (Z - Z.mean(0)) / (Z.std(0) + 1e-12)])
+    beta, *_ = np.linalg.lstsq(Zc, Y, rcond=None)
+    return Y - Zc @ beta
+
+
+def print_residual_effect(names, Y_raw, Y_res, Z, cov):
+    """Per AM: Pearson r with each covariate before and after residualisation (after is ~0 by construction)."""
+    m = Y_raw.shape[1]
+    print(f"\nresidualised on {', '.join(cov)}: AM vs covariate correlation, before -> after")
+    print(f"{'AM':22s} " + " ".join(f"{c:>22s}" for c in cov))
+    for k in range(m):
+        cells = []
+        for j in range(len(cov)):
+            zj = np.repeat(Z[:, [j]], m, axis=1)
+            rb = pearson(Y_raw[:, [k]], zj[:, [0]])[0]
+            ra = pearson(Y_res[:, [k]], zj[:, [0]])[0]
+            cells.append(f"{rb:+.2f} -> {ra:+.2f}")
+        print(f"{names[k]:22s} " + " ".join(f"{c:>22s}" for c in cells))
+
+
 # ------------------------------------------------------------------ run
 def run(a):
     ids, X, Y, grp, names, sel = load_data(a)
     n = len(ids)
     if getattr(a, "exclude", ""):
         print(f"\nSENSITIVITY RUN: --exclude {a.exclude}")
+    cov = [c.strip() for c in (getattr(a, "residualize", "") or "").split(",") if c.strip()]
+    if cov:
+        bad = [c for c in cov if c not in CONTROL_NAMES]
+        if bad:
+            raise SystemExit(f"--residualize: unknown covariates {bad}; choose from {CONTROL_NAMES}")
+        if not a.controls:
+            raise SystemExit("--residualize needs --controls DIR (the covariates come from DIR/<id>.npz)")
+        Z = covariate_matrix(a.controls, ids, cov)
+        Y_raw = Y.copy()
+        Y = residualize(Y, Z)
+        print_residual_effect(names, Y_raw, Y, Z, cov)
+        print("  note: all subsequent numbers are for the residualised AMs (the covariates are removed from the targets).")
     sexes, counts = np.unique(grp, return_counts=True)
     print(f"\n{n} speakers; sex counts: {dict(zip(sexes.tolist(), counts.tolist()))}; embedding dim {X.shape[1]}")
     if len(sexes) < 2 or counts.min() < 3:
@@ -335,8 +389,31 @@ def selftest(seed=0):
     ok_pl = _plumbing_test()
     print("plumbing (--exclude, control features, controls run):", "ok" if ok_pl else "FAILED")
     ok = ok and ok_pl
+    ok_rs = _residual_test()
+    print("residualisation (removes a planted covariate, keeps the voice signal):", "ok" if ok_rs else "FAILED")
+    ok = ok and ok_rs
     print("SELFTEST", "PASSED" if ok else "FAILED")
     raise SystemExit(0 if ok else 1)
+
+
+def _residual_test(seed=2):
+    """Planted confounder: AMs = voice-related signal + a * yaw + noise. After residualising on yaw, the AM-yaw
+    correlation must drop to ~0 and the voice prediction within sex must stay (the signal was not on yaw)."""
+    rng = np.random.default_rng(seed)
+    n, d, m = 40, 48, 4
+    grp = np.array(["m", "f"] * (n // 2))
+    z = rng.normal(size=(n, 3))
+    X = z @ rng.normal(size=(3, d)) + rng.normal(size=(n, d)) * 0.5
+    yaw = rng.normal(size=(n, 1))
+    Y = z @ rng.normal(size=(3, m)) + 2.0 * yaw + rng.normal(size=(n, m)) * 0.3
+    Yr = residualize(Y, yaw)
+    r_before = float(np.nanmean(np.abs(pearson(Y, np.repeat(yaw, m, 1)))))
+    r_after = float(np.nanmean(np.abs(pearson(Yr, np.repeat(yaw, m, 1)))))
+    P_before, _ = loo_predict(X, Y)
+    P_after, _ = loo_predict(X, Yr)
+    rw_after = float(np.nanmean(metrics(Yr, P_after, grp)["r_within"]))
+    print(f"residualisation check: |r(AM,yaw)| {r_before:.2f} -> {r_after:.2f}; r_within after {rw_after:.2f}")
+    return r_before > 0.5 and r_after < 0.1 and rw_after > 0.3
 
 
 def _plumbing_test():
@@ -382,12 +459,21 @@ def main():
                     help="comma-separated speaker ids to leave out of everything (sensitivity check)")
     ap.add_argument("--controls", default=None,
                     help="directory with faces/<id>.npz: also run the negative controls (video conditions as targets)")
+    ap.add_argument("--residualize", default="",
+                    help="comma-separated video covariates (log_sharpness,log_face_px,mean_abs_yaw,mean_abs_roll) to "
+                         "regress out of every AM before the model; needs --controls DIR for the covariates")
     a = ap.parse_args()
     if a.selftest:
         selftest()
     if a.out is None:
         ex = [x.strip() for x in a.exclude.split(",") if x.strip()]
-        a.out = "results.csv" if not ex else "results_excl_" + "-".join(ex) + ".csv"
+        cov = [x.strip() for x in a.residualize.split(",") if x.strip()]
+        name = "results"
+        if cov:
+            name += "_resid_" + "-".join(cov)
+        if ex:
+            name += "_excl_" + "-".join(ex)
+        a.out = name + ".csv"
     run(a)
 
 
