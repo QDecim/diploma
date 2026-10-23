@@ -2,3 +2,5 @@ run,covariates_removed,perm_shuffles,p_all_speakers,null_mean_r_all,p_within_sex
 baseline,none,2000,0.002,,0.028,-0.08,0.133,15
 resid_yaw,mean_abs_yaw,2000,0.015,-0.04,0.247,-0.08,-0.009,15
 resid_yaw_sharp,mean_abs_yaw+log_sharpness,2000,0.021,-0.04,0.267,-0.08,-0.013,15
+resid_yaw_perfold,mean_abs_yaw,2000,0.010,0.02,0.188,-0.02,,15
+resid_yaw_sharp_perfold,mean_abs_yaw+log_sharpness,2000,0.017,0.02,0.225,-0.02,,15
